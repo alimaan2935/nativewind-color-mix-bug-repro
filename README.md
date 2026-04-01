@@ -1,4 +1,4 @@
-# react-native-css color-mix bug: `bg-black/50` silently fails
+# react-native-css bug: `bg-black/50` silently fails
 
 Minimal repro for a bug where opacity modifiers on `black` silently fail on React Native.
 
@@ -18,57 +18,54 @@ Open on iOS simulator or device.
 | `bg-red-500/50` | Semi-transparent red | Semi-transparent red |
 | `bg-black/50` | Semi-transparent black | **No background (dropped)** |
 | `bg-black` | Solid black | Solid black |
+| `border-black/50` | Semi-transparent black border | **Solid black (opacity lost)** |
 | `border-white/50` | Semi-transparent white border | Semi-transparent white border |
 | `bg-white/50` | Semi-transparent white | Semi-transparent white |
-| `border-black/50` | Semi-transparent black border | **Solid black (opacity lost)** |
-
-The bug affects **`black` (`#000`) with any opacity modifier**. `white` (`#fff`) works fine.
 
 ## Root cause
 
-Tailwind v4 generates this for `bg-black/50`:
+lightningcss resolves `color-mix(in oklab, #000 50%, transparent)` and produces **`NaN`**
+for the oklab `a` and `b` channels. Black in oklab is `[l=0, a=0, b=0]`, but `transparent`
+has undefined color channels in CSS. When mixed at zero lightness, the chromaticity channels
+become `NaN` (degenerate case).
 
-```css
-.bg-black\/50 {
-  background-color: color-mix(in srgb, #000 50%, transparent);
-  @supports (color: color-mix(in lab, red, red)) {
-    background-color: color-mix(in oklab, var(--color-black) 50%, transparent);
-  }
-}
-```
+`parseColor` in `declarations.js` passes these `NaN` coords to `colorjs.io`, which produces
+`#NaNNaNNaN80` — an invalid color string that React Native silently discards.
 
-`react-native-css`'s `inlineVariables` optimization (enabled by default) replaces
-`var(--color-black)` with the raw token value from `--color-black: #000`. After inlining,
-the token `#000` arrives in `parseUnparsed` as a raw hash token which is silently dropped
-(returns `undefined`), causing `parseColorMix` to bail out.
+White works because its oklab values are all numeric (`l:1, a:0, b:~5.96e-8`) — lightness
+is non-zero, so the chromaticity channels don't degenerate.
 
-**Why `white` works but `black` doesn't:** CSS tokenization distinguishes `#000` (all digits
-→ token type `"hash"`) from `#fff` (starts with letter → token type `"id-hash"`). These
-take different code paths in lightningcss after inlining — `#fff` likely gets re-parsed as
-a color while `#000` stays as a raw hash token that `parseUnparsed` cannot handle.
+### Full chain
 
-Both `"hash"` and `"id-hash"` are listed in `parseUnparsed`'s unhandled group
-(declarations.js lines 844-846), but the inlining pipeline appears to only produce raw hash
-tokens for `#000`, not for `#fff`.
+1. Tailwind v4 generates `@supports (color: color-mix(in lab, red, red))` override
+2. `react-native-css` evaluates `@supports` as TRUE (since PR #208)
+3. `inlineVariables` (default) inlines `--color-black: #000` → lightningcss resolves color-mix statically
+4. lightningcss produces `{"type":"oklab","l":0,"a":NaN,"b":NaN,"alpha":0.5}`
+5. `parseColor` passes NaN to colorjs.io → `#NaNNaNNaN80` → style dropped
 
 ## Proposed fix
 
-In `react-native-css/dist/module/compiler/declarations.js`, handle hash tokens in
-`parseUnparsed`:
+In `parseColor` (`declarations.js`), guard against `NaN` with `|| 0` for lab/lch/oklab/oklch.
+Note: `NaN ?? 0` does NOT work — `NaN` is not nullish. `NaN || 0` is needed.
 
 ```diff
--        case "hash":
--        case "id-hash":
--        case "unquoted-url":
-+        case "hash":
-+        case "id-hash":
-+          return `#${tokenOrValue.value.value}`;
-+        case "unquoted-url":
+     case "oklab":
+       color = new Color({
+         space: cssColor.type,
+-        coords: [cssColor.l, cssColor.a, cssColor.b],
++        coords: [cssColor.l || 0, cssColor.a || 0, cssColor.b || 0],
+         alpha: cssColor.alpha
+       });
+       break;
 ```
+
+Same for `oklch`, `lab`, and `lch` cases. Verified working in this repro project.
 
 ## Workaround
 
-Re-declare `--color-black` in `:root` to prevent inlining (bumps declaration count to 2):
+Re-declare `--color-black` in `:root` to prevent `inlineVariables` from inlining it
+(bumps declaration count to 2). The runtime color-mix polyfill then handles it instead
+of lightningcss's static resolution:
 
 ```css
 :root {
